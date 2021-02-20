@@ -1,12 +1,12 @@
 /*  zfolder.h - v0.1 - Alessandro Bason 2021
 
-    This is a small single header file library to easily compress and 
+    This is a small single header file library to easily compress and
     decompress folders using zstandard
 
     To use this library, do this in one C or C++ file:
         #define Z_FOLDER_IMPLEMENTATION
         #include "zfolder.h"
-    
+
   COMPILE TIME OPTIONS:
 
     #define MAX_FILES [n]
@@ -16,7 +16,7 @@
         maximum path length (not more than 255) (default: 128)
 
   USAGE:
-    
+
     // == COMPRESSION ==========================
     zfolder dir;
     zf_init(&dir);
@@ -62,6 +62,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef Z_MAX_FILES
 #define Z_MAX_FILES 2048
 #endif
@@ -76,7 +80,7 @@ FORMAT:
     files header: (there are nfiles file headers)
         plen (1 bytes) -> length of path string
         flen (4 bytes) -> length of this specific file
-        path (plen bytes) -> pathname (string DOES NOT END WITH NULL) 
+        path (plen bytes) -> pathname (string DOES NOT END WITH NULL)
     dlen (4 bytes) -> length of unencoded data
     data -> just a stream of data until the end of the file
 */
@@ -104,7 +108,7 @@ typedef struct {
 // initialize zfolder object
 void zf_init(zfolder *dir);
 // add a file to the zfolder
-void zf_add_file(zfolder *dir, char path[Z_MAX_PATH_LEN]);
+void zf_add_file(zfolder *dir, const char path[Z_MAX_PATH_LEN]);
 // add an entire directory to the zfolder
 void zf_add_dir(zfolder *dir, const char *path, bool recursive);
 // compress the zfolder
@@ -118,22 +122,36 @@ uint8_t *zf_get_file(zfolder *dir, uint32_t index);
 // destroy the zfolder object
 void zf_destroy(zfolder *dir);
 
+#ifdef __cplusplus
+}
+#endif
+
 #endif // INCLUDE_Z_FOLDER_H
 
-/* +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
-  +                                        +
-  -             IMPLEMENTATION             -
-  +                                        +
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- */
+/* *************************************************************|
+|*                                                             *|
+|*                        IMPLEMENTATION                       *|
+|*                                                             *|
+|*_____________________________________________________________*/
 
 #ifdef Z_FOLDER_IMPLEMENTATION
 
-#include <stdio.h> 
-#include <stdlib.h>
-#include <string.h>
-#include <dirent.h>
+#if defined(_WIN32) || defined(WIN32)
+#define Z_WINDOWS
+#elif defined(linux) || defined(__unix__)
+#define Z_LINUX
+#endif
 
-#include <sys/stat.h>
+#include <stdio.h>  // fprintf FILE
+#include <stdlib.h> // malloc realloc free
+#include <string.h> // memcpy strcpy strncpy strnlen strlen
+#include <dirent.h> // DIR
+
+#include <sys/stat.h> // stat
+
+#ifdef Z_WINDOWS
+#include <direct.h> // _mkdir
+#endif
 
 #include <zstd.h> // zstandard compression
 
@@ -148,21 +166,15 @@ void zf_destroy(zfolder *dir);
 #define nread_from_buf(buf, data, n) do { memcpy(&(data), (buf), (n)); (buf) += (n); } while(0);
 #define read_from_buf(buf, data) nread_from_buf(buf, data, sizeof(data))
 
-#define next_path()             \
-            size_t sz = (path_tmp-1) - path;  \
-            char cur_path[sz+1];         \
-            strncpy(cur_path, path, sz); \
-            cur_path[sz] = '\0';
-
 // == STATIC FUNCTIONS ==========================================
 
 static uint32_t _zf_read_file(const char *path, zfolder *dir);
 static uint32_t _read_whole_file(const char *fname, uint8_t **data);
 static void _write_whole_file(const char *path, uint8_t *data, size_t dlen);
-static bool _strcmp(const char *s1, const char *s2);
 static void _concat_path(char *dst, const char *dir, const char *path, size_t path_length);
 static uint8_t _split_path(const char **path);
 static void _create_necessary_dirs(const char *path);
+static void _create_dir(const char *path);
 
 // == FUNCTIONS =================================================
 
@@ -170,42 +182,43 @@ void zf_init(zfolder *dir) {
     memset(dir, 0, sizeof(zfolder));
 }
 
-void zf_add_file(zfolder *dir, char path[Z_MAX_PATH_LEN]) {
+void zf_add_file(zfolder *dir, const char path[Z_MAX_PATH_LEN]) {
     zfile *current = &dir->files[dir->nfiles++];
     strncpy(current->path, path, Z_MAX_PATH_LEN);
-    current->plen = strnlen(current->path, Z_MAX_PATH_LEN);
+    // should never be more than Z_MAX_PATH_LEN anyway
+    current->plen = (uint8_t) strnlen(current->path, Z_MAX_PATH_LEN);
     current->flen = _zf_read_file(path, dir);
 }
 
 void zf_add_dir(zfolder *_dir, const char *path, bool recursive) {
     DIR *d = opendir(path);
-    if(!d)
+    if (!d)
         crashfmt("couldn't open directory -> %s", path);
 
-    size_t plen = strlen(path); // path lenght
+    size_t plen = strlen(path); // path length
     struct dirent *dir;
-    while((dir = readdir(d)) != NULL) {
-        if(dir->d_type == DT_DIR && recursive) {
+    char temp_fname[Z_MAX_PATH_LEN];
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_type == DT_DIR && recursive) {
             // "." is the current directory, ".." is the previous directory
-            if(_strcmp(dir->d_name, ".") || _strcmp(dir->d_name, "..")) 
+            if (strcmp(dir->d_name, ".") == 0 || 
+                strcmp(dir->d_name, "..") == 0)
                 continue;
 
-            // get final path lenght (path/dir)
+            // get final path length (path/dir)
             size_t dlen = strlen(dir->d_name) + plen + 1;
-            if(dlen > Z_MAX_PATH_LEN)
+            if (dlen > Z_MAX_PATH_LEN)
                 crashfmt("path is too long -> %s/%s", path, dir->d_name);
 
-            char temp_fname[dlen+1];
             _concat_path(temp_fname, dir->d_name, path, plen);
             zf_add_dir(_dir, temp_fname, true);
         }
-        else if(dir->d_type == DT_REG) {
-            // get final path lenght (path/dir)
+        else if (dir->d_type == DT_REG) {
+            // get final path length (path/dir)
             size_t dlen = strlen(dir->d_name) + plen + 1;
-            if(dlen > Z_MAX_PATH_LEN)
+            if (dlen > Z_MAX_PATH_LEN)
                 crashfmt("path is too long -> %s/%s", path, dir->d_name);
-            
-            char temp_fname[dlen+1];
+
             _concat_path(temp_fname, dir->d_name, path, plen);
             zf_add_file(_dir, temp_fname);
         }
@@ -222,11 +235,11 @@ void zf_compress(zfolder *dir, const char *path, int compression_level) {
     max_len += sizeof(dir->dlen);
     max_len += dir->dlen;
 
-    uint8_t *to_compress = malloc(max_len);
+    uint8_t *to_compress = (uint8_t*) malloc(max_len);
     uint8_t *cur = to_compress;
 
     printf("number of files: %u\n", dir->nfiles);
-    
+
     copy_to_buf(cur, dir->nfiles);
     for (uint32_t i = 0; i < dir->nfiles; ++i) {
         copy_to_buf(cur, dir->files[i].plen);
@@ -236,14 +249,14 @@ void zf_compress(zfolder *dir, const char *path, int compression_level) {
     copy_to_buf(cur, dir->dlen);
     ncopy_to_buf(cur, *dir->data, dir->dlen);
 
-    size_t src_len = cur - (uint8_t*)to_compress;
+    size_t src_len = cur - (uint8_t *)to_compress;
     size_t dst_len = ZSTD_compressBound(src_len);
-    uint8_t *dst = malloc(dst_len);
+    uint8_t *dst = (uint8_t *) malloc(dst_len);
 
     size_t res = ZSTD_compress(dst, dst_len, to_compress, src_len, compression_level);
-    if(ZSTD_isError(res))
+    if (ZSTD_isError(res))
         crash("couldn't compress data");
-    
+
     _write_whole_file(path, dst, res);
 
     free(to_compress);
@@ -258,19 +271,19 @@ void zf_compress(zfolder *dir, const char *path, int compression_level) {
 
 void zf_decompress(zfolder *dir, const char *fname) {
     uint8_t *compressed;
-    // compressed lenght
+    // compressed length
     uint32_t clen = _read_whole_file(fname, &compressed);
-    
+
     size_t res = ZSTD_getFrameContentSize(compressed, clen);
-    
-    if(res == ZSTD_CONTENTSIZE_UNKNOWN || res == ZSTD_CONTENTSIZE_ERROR) 
+
+    if (res == ZSTD_CONTENTSIZE_UNKNOWN || res == ZSTD_CONTENTSIZE_ERROR)
         crash("couldn't retrieve size from file");
-    
+
     size_t dst_len = res;
-    uint8_t *dst = malloc(dst_len);
+    uint8_t *dst = (uint8_t *) malloc(dst_len);
     res = ZSTD_decompress(dst, dst_len, compressed, clen);
     free(compressed);
-    if(ZSTD_isError(res))
+    if (ZSTD_isError(res))
         crash("couldn't decompress data");
 
     uint8_t *buf = dst;
@@ -282,34 +295,34 @@ void zf_decompress(zfolder *dir, const char *fname) {
         nread_from_buf(buf, dir->files[i].path, dir->files[i].plen);
     }
     read_from_buf(buf, dir->dlen);
-    dir->data = malloc(dir->dlen);
+    dir->data = (uint8_t *) malloc(dir->dlen);
     nread_from_buf(buf, *dir->data, dir->dlen);
-    
+
     free(dst);
 }
 
 void zf_decompress_todir(zfolder *dir, const char *output, bool overwrite) {
-    struct stat st = {0};
-    if(stat(output, &st) != -1 && !overwrite)
+    struct stat st = { 0 };
+    if (stat(output, &st) != -1 && !overwrite)
         crashfmt("folder %s already exists", output);
-    mkdir(output, 0777);
+    _create_dir(output);
 
     size_t pathlen = strlen(output);
 
+    char temp_path[Z_MAX_PATH_LEN * 2];
     for (uint32_t i = 0; i < dir->nfiles; ++i) {
         uint8_t *data = zf_get_file(dir, i);
         size_t len = dir->files[i].flen;
 
         // make sure that the path finishes with \0
         dir->files[i].path[dir->files[i].plen] = '\0';
-        
+
         size_t path_len = dir->files[i].plen + pathlen + 1;
-        char temp_path[path_len];
         memset(temp_path, '\0', path_len);
         _concat_path(temp_path, dir->files[i].path, output, pathlen);
-        
+
         _create_necessary_dirs(temp_path);
-        
+
         _write_whole_file(temp_path, data, len);
     }
 }
@@ -318,7 +331,7 @@ uint8_t *zf_get_file(zfolder *dir, uint32_t index) {
     uint32_t offset = 0;
     for (uint32_t i = 0; i < index; ++i)
         offset += dir->files[i].flen;
-    
+
     return dir->data + offset;
 }
 
@@ -331,19 +344,21 @@ void zf_destroy(zfolder *dir) {
 
 static uint32_t _zf_read_file(const char *path, zfolder *dir) {
     FILE *f = fopen(path, "rb");
-    if(!f) 
+    if (!f)
         crashfmt("couldn't open file -> %s", path);
     // get file length
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
-    if(len < 0)
-        crash("lenght of file is negative");
+    if (len < 0)
+        crash("length of file is negative");
     fseek(f, 0, SEEK_SET);
 
     // allocate enough space to read the new data
-    dir->data = realloc(dir->data, dir->dlen + len);
+    dir->data = (uint8_t *) realloc(dir->data, dir->dlen + len);
+    if (!dir->data)
+        crashfmt("couldn't allocate data when reading the file %s", path);
     // read data at the end of the buffer
-    fread((dir->data + dir->dlen), len, 1, f);    
+    fread((dir->data + dir->dlen), len, 1, f);
     dir->dlen += len;
 
     fclose(f);
@@ -352,17 +367,19 @@ static uint32_t _zf_read_file(const char *path, zfolder *dir) {
 
 static uint32_t _read_whole_file(const char *fname, uint8_t **data) {
     FILE *f = fopen(fname, "rb");
-    if(!f) 
+    if (!f)
         crashfmt("couldn't open file -> %s", fname);
     // get file length
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
-    if(len < 0)
-        crash("lenght of file is negative");
+    if (len < 0)
+        crash("length of file is negative");
     fseek(f, 0, SEEK_SET);
 
     // allocate enough space to read the new data
-    *data = malloc(len);
+    *data = (uint8_t *) malloc(len);
+    if (!data)
+        crashfmt("couldn't allocate data when reading %s", fname);
     // read data at the end of the buffer
     fread(*data, len, 1, f);
 
@@ -372,22 +389,11 @@ static uint32_t _read_whole_file(const char *fname, uint8_t **data) {
 
 static void _write_whole_file(const char *path, uint8_t *data, size_t dlen) {
     FILE *f = fopen(path, "wb");
-    if(!f)
+    if (!f)
         crashfmt("couldn't open file -> %s", path);
     fwrite(data, dlen, 1, f);
 
     fclose(f);
-}
-
-static bool _strcmp(const char *s1, const char *s2) {
-    // check that all the characters are the same
-    for (; *s1 && *s2 ; ++s1, ++s2)
-        if (*s1 != *s2)
-            return false;
-    // check that it didn't finish early
-    if (*s1 != '\0' || *s2 != '\0')
-        return false;
-    return true;
 }
 
 static void _concat_path(char *dst, const char *dir, const char *path, size_t path_length) {
@@ -399,8 +405,8 @@ static void _concat_path(char *dst, const char *dir, const char *path, size_t pa
 static uint8_t _split_path(const char **path) {
     const char *c = *path;
     for (uint8_t len = 0; *c; c++, len++) {
-        if(*c == '/') {
-            *path += len+1;
+        if (*c == '/') {
+            *path += len + 1;
             return len;
         }
     }
@@ -413,16 +419,28 @@ static void _create_necessary_dirs(const char *path) {
 
     const char *tmp_path = path;
 
-    struct stat st = {0};
+    struct stat st = { 0 };
     uint8_t len = 0;
-    while((len = _split_path(&tmp_path))) {
+    char buf[Z_MAX_PATH_LEN];
+    while ((len = _split_path(&tmp_path))) {
         size_t sz = (tmp_path - 1) - path;
-        char buf[sz+1];
+        if (sz > Z_MAX_PATH_LEN)
+            crashfmt("%zu is more than the maximum path length: %u\n", sz, Z_MAX_PATH_LEN);
         strncpy(buf, path, sz);
         buf[sz] = '\0';
 
-        if(stat(buf, &st) == -1)
-            mkdir(buf, 0777);
+        if (stat(buf, &st) == -1)
+            _create_dir(buf);
     }
 }
+
+static void _create_dir(const char *path) {
+#ifdef Z_WINDOWS
+    _mkdir(path);
+#elif defined(Z_LINUX)
+    mkdir(path, 0777);
+#endif
+}
+
+
 #endif // Z_FOLDER_IMPLEMENTATION
