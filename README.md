@@ -2,8 +2,8 @@
 Single header library to compress file/libraries using zstandard
 
 ### Dependencies
-- zstd [ github.com/facebook/zstd ]
-- (only on windows) dirent [ github.com/tronkko/dirent ]
+- zstd [[ github ]](https://github.com/facebook/zstd)
+- (only on windows) dirent [[ github ]](https://github.com/tronkko/dirent)
 
 ### Example usage
 Compression
